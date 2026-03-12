@@ -113,6 +113,8 @@ export class TraceCollector {
   private activeRuns = new Map<string, RunEntry>();
   private activeTools = new Map<string, ToolEntry>();
   private activeSubagents = new Map<string, SubagentEntry>();
+  // Map parent sessionKey prefix → traceId, so subagent sessions can inherit
+  private parentTraceIds = new Map<string, { traceId: string; parentSpanId: string }>();
 
   constructor(emit: (span: TraceSpan) => void) {
     this.emit = emit;
@@ -123,6 +125,61 @@ export class TraceCollector {
     ctx: { sessionKey?: string; sessionId?: string },
   ): string {
     return event.sessionKey ?? ctx.sessionKey ?? event.sessionId ?? ctx.sessionId ?? "unknown";
+  }
+
+  /** Ensure a session entry exists; create a synthetic one if session_start was missed. */
+  private ensureSession(
+    event: { sessionKey?: string; sessionId?: string },
+    ctx: { sessionKey?: string; sessionId?: string; agentId?: string },
+  ): SessionEntry {
+    const key = this.sessionKey(event, ctx);
+    let session = this.sessions.get(key);
+    if (!session) {
+      const spanId = genId();
+      const start = nowMs();
+
+      // Try to inherit traceId from parent session if this is a subagent
+      // sessionKey pattern: "agent:main:subagent:UUID" — parent is "agent:main:main"
+      let traceId = genId();
+      let parentSpanId: string | undefined;
+
+      // Look up any registered parent trace for this session key
+      for (const [prefix, parent] of this.parentTraceIds) {
+        if (key.startsWith(prefix)) {
+          traceId = parent.traceId;
+          parentSpanId = parent.parentSpanId;
+          break;
+        }
+      }
+
+      // Also check: if sessionKey contains ":subagent:", try to find parent session
+      if (!parentSpanId && key.includes(":subagent:")) {
+        const parentKey = key.replace(/:subagent:.*$/, ":main");
+        const parentSession = this.sessions.get(parentKey);
+        if (parentSession) {
+          traceId = parentSession.traceId;
+          parentSpanId = parentSession.spanId;
+        }
+      }
+
+      session = { traceId, spanId, startMs: start };
+      this.sessions.set(key, session);
+
+      // Emit a synthetic session-start span
+      const span: TraceSpan = {
+        traceId,
+        spanId,
+        parentSpanId,
+        kind: "session",
+        name: "session",
+        agentId: (ctx as { agentId?: string }).agentId,
+        sessionKey: key,
+        startMs: start,
+        attributes: { synthetic: true },
+      };
+      this.emit(span);
+    }
+    return session;
   }
 
   onSessionStart(event: SessionStartEvent, ctx: SessionContext): void {
@@ -184,8 +241,7 @@ export class TraceCollector {
 
   onLlmInput(event: LlmInputEvent, ctx: AgentContext): void {
     const key = this.sessionKey({ sessionId: event.sessionId }, ctx);
-    const session = this.sessions.get(key);
-    if (!session) return;
+    const session = this.ensureSession({ sessionId: event.sessionId }, ctx);
 
     const spanId = genId();
     const start = nowMs();
@@ -236,8 +292,7 @@ export class TraceCollector {
 
   onBeforeToolCall(event: BeforeToolCallEvent, ctx: ToolContext): void {
     const key = this.sessionKey({}, ctx);
-    const session = this.sessions.get(key);
-    if (!session) return;
+    const session = this.ensureSession({}, ctx);
 
     const spanId = genId();
     const start = nowMs();
@@ -267,6 +322,13 @@ export class TraceCollector {
 
     this.activeTools.set(toolCallId, { spanId, span });
     this.emit(span);
+
+    // When sessions_spawn is called, register the parent traceId so subagent sessions
+    // can inherit it. The subagent sessionKey will start with the parent's sessionKey prefix.
+    if (event.toolName === "sessions_spawn") {
+      const parentPrefix = key.replace(/:main$/, "");
+      this.parentTraceIds.set(parentPrefix, { traceId: session.traceId, parentSpanId: session.spanId });
+    }
   }
 
   onAfterToolCall(event: AfterToolCallEvent, ctx: ToolContext): void {
@@ -297,8 +359,7 @@ export class TraceCollector {
     const requesterKey = ctx.requesterSessionKey;
     if (!requesterKey) return;
 
-    const session = this.sessions.get(requesterKey);
-    if (!session) return;
+    const session = this.ensureSession({ sessionKey: requesterKey }, ctx);
 
     const spanId = genId();
     const start = nowMs();

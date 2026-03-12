@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/tracing";
-import { emptyPluginConfigSchema } from "openclaw/plugin-sdk/tracing";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { TraceCollector } from "./src/collector.js";
 import { JsonlTraceWriter } from "./src/storage-jsonl.js";
 import { renderCallTree, renderEntityTree, renderWaterfall } from "./src/viewer-cli.js";
@@ -15,20 +15,47 @@ const plugin = {
   register(api: OpenClawPluginApi) {
     const traceDir = path.join(os.homedir(), ".openclaw", "traces");
     const writer = new JsonlTraceWriter(traceDir);
-    const collector = new TraceCollector((span) => writer.write(span));
+    const collector = new TraceCollector((span) => {
+      api.logger.info(`[tracing] emit span: kind=${span.kind} name=${span.name}`);
+      writer.write(span);
+    });
 
-    api.on("session_start", (event, ctx) => collector.onSessionStart(event, ctx));
-    api.on("session_end", (event, ctx) => collector.onSessionEnd(event, ctx));
-    api.on("llm_input", (event, ctx) => collector.onLlmInput(event, ctx));
-    api.on("llm_output", (event, ctx) => collector.onLlmOutput(event, ctx));
+    api.logger.info("[tracing] registering hooks...");
+
+    api.on("session_start", (event, ctx) => {
+      api.logger.info(`[tracing] session_start fired: sessionId=${event.sessionId}`);
+      collector.onSessionStart(event, ctx);
+    });
+    api.on("session_end", (event, ctx) => {
+      api.logger.info(`[tracing] session_end fired: sessionId=${event.sessionId}`);
+      collector.onSessionEnd(event, ctx);
+    });
+    api.on("llm_input", (event, ctx) => {
+      api.logger.info(`[tracing] llm_input fired: model=${event.model}`);
+      collector.onLlmInput(event, ctx);
+    });
+    api.on("llm_output", (event, ctx) => {
+      api.logger.info(`[tracing] llm_output fired: model=${event.model}`);
+      collector.onLlmOutput(event, ctx);
+    });
     api.on("before_tool_call", (event, ctx) => {
+      api.logger.info(`[tracing] before_tool_call fired: tool=${event.toolName}`);
       collector.onBeforeToolCall(event, ctx);
     });
-    api.on("after_tool_call", (event, ctx) => collector.onAfterToolCall(event, ctx));
+    api.on("after_tool_call", (event, ctx) => {
+      api.logger.info(`[tracing] after_tool_call fired: tool=${event.toolName}`);
+      collector.onAfterToolCall(event, ctx);
+    });
     api.on("subagent_spawning", (event, ctx) => {
+      api.logger.info(`[tracing] subagent_spawning fired: agent=${event.agentId}`);
       collector.onSubagentSpawning(event, ctx);
     });
-    api.on("subagent_ended", (event, ctx) => collector.onSubagentEnded(event, ctx));
+    api.on("subagent_ended", (event, ctx) => {
+      api.logger.info(`[tracing] subagent_ended fired`);
+      collector.onSubagentEnded(event, ctx);
+    });
+
+    api.logger.info("[tracing] hooks registered OK");
 
     // Web UI at /plugins/tracing
     api.registerHttpRoute({
