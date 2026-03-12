@@ -135,6 +135,28 @@ const VIEWER_HTML = `<!DOCTYPE html>
   .tree-group-body { display: none; }
   .tree-group-body.open { display: block; }
   .tree-group-summary { color: var(--dim); font-size: 12px; margin-left: 4px; }
+
+  /* Work Index */
+  .wi-container { display: flex; flex-direction: column; gap: 16px; }
+  .wi-chart { position: relative; width: 100%; height: 200px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); overflow: hidden; }
+  .wi-chart svg { width: 100%; height: 100%; }
+  .wi-score-card { display: flex; gap: 16px; flex-wrap: wrap; }
+  .wi-card { flex: 1; min-width: 160px; padding: 14px 18px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+  .wi-card .wi-label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.5px; }
+  .wi-card .wi-value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+  .wi-card .wi-sub { font-size: 11px; color: var(--dim); margin-top: 2px; }
+  .wi-phases { width: 100%; border-collapse: collapse; }
+  .wi-phases th { text-align: left; padding: 6px 10px; border-bottom: 2px solid var(--border); font-size: 11px; color: var(--dim); text-transform: uppercase; }
+  .wi-phases td { padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .wi-phases tr:hover { background: var(--surface); }
+  .wi-bar-cell { width: 120px; }
+  .wi-bar-bg { width: 100px; height: 14px; background: var(--surface2); border-radius: 7px; display: inline-block; vertical-align: middle; overflow: hidden; }
+  .wi-bar-fill { height: 100%; border-radius: 7px; }
+  .wi-status { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .wi-status-high { background: #dcfce7; color: #166534; }
+  .wi-status-mid { background: #fef9c3; color: #854d0e; }
+  .wi-status-low { background: #fee2e2; color: #991b1b; }
+  .wi-status-idle { background: var(--surface2); color: var(--dim); }
 </style>
 </head>
 <body>
@@ -152,6 +174,7 @@ const VIEWER_HTML = `<!DOCTYPE html>
   <div class="tab active" data-view="call">📊 Call Tree</div>
   <div class="tab" data-view="entity">🕸️ Entity Graph</div>
   <div class="tab" data-view="waterfall">⏱️ Waterfall</div>
+  <div class="tab" data-view="workindex">📈 Work Index</div>
 </div>
 <div class="content" id="content"></div>
 
@@ -213,7 +236,8 @@ function render() {
   if (!spans.length) { c.innerHTML = '<div class="empty">No traces for this date.</div>'; return; }
   if (currentView === 'call') c.innerHTML = renderCallTree();
   else if (currentView === 'entity') c.innerHTML = renderEntityTree();
-  else c.innerHTML = renderWaterfall();
+  else if (currentView === 'waterfall') c.innerHTML = renderWaterfall();
+  else if (currentView === 'workindex') c.innerHTML = renderWorkIndex();
 }
 
 // Utils
@@ -704,6 +728,183 @@ function renderWaterfall() {
   html += '</div>';
   html += '<div class="summary">Total duration: <strong>' + fmtDur(total) + '</strong></div>';
   return html;
+}
+
+// Work Index
+function renderWorkIndex() {
+  // Dedupe
+  const closed = new Map();
+  for (const s of spans) {
+    if (!closed.has(s.spanId) || s.endMs != null) closed.set(s.spanId, s);
+  }
+  const deduped = [...closed.values()];
+  if (!deduped.length) return '<div class="empty">No spans to analyze.</div>';
+
+  const minStart = Math.min(...deduped.map(s => s.startMs));
+  const maxEnd = Math.max(...deduped.map(s => s.endMs || s.startMs));
+  const totalDuration = maxEnd - minStart || 1;
+
+  // Slice into time windows (each ~10% of total or at least 5s)
+  const windowSize = Math.max(5000, totalDuration / 12);
+  const windows = [];
+  for (let t = minStart; t < maxEnd; t += windowSize) {
+    const wEnd = Math.min(t + windowSize, maxEnd);
+    const wSpans = deduped.filter(s => s.startMs < wEnd && (s.endMs || s.startMs) > t);
+    const llmCalls = wSpans.filter(s => s.kind === 'llm_call').length;
+    const toolCalls = wSpans.filter(s => s.kind === 'tool_call').length;
+    const tokensUsed = wSpans.reduce((sum, s) => sum + (s.tokensIn || 0) + (s.tokensOut || 0), 0);
+    const subagents = wSpans.filter(s => s.kind === 'subagent').length;
+
+    // Work Index formula:
+    // tool_density = toolCalls / max(llmCalls, 1)
+    // token_efficiency = toolCalls / max(tokensUsed / 1000, 0.1)
+    // bonus for subagent spawns (delegation = productive)
+    // penalty for consecutive empty LLM calls
+    const toolDensity = toolCalls / Math.max(llmCalls, 1);
+    const tokenEff = toolCalls / Math.max(tokensUsed / 1000, 0.1);
+
+    let score;
+    if (llmCalls === 0 && toolCalls === 0) {
+      score = 0; // idle
+    } else {
+      // Normalize: toolDensity usually 0-5, tokenEff usually 0-3
+      // Score 0-100
+      score = Math.min(100, Math.round(
+        (Math.min(toolDensity, 5) / 5) * 50 +
+        (Math.min(tokenEff, 3) / 3) * 30 +
+        (subagents > 0 ? 20 : 0)
+      ));
+      // If lots of tokens but no tools, cap low
+      if (llmCalls > 0 && toolCalls === 0) score = Math.min(score, 15);
+    }
+
+    let status, statusClass;
+    if (score === 0) { status = 'Idle'; statusClass = 'idle'; }
+    else if (score <= 25) { status = 'Spinning'; statusClass = 'low'; }
+    else if (score <= 60) { status = 'Planning'; statusClass = 'mid'; }
+    else { status = 'Working'; statusClass = 'high'; }
+
+    windows.push({
+      startMs: t, endMs: wEnd, llmCalls, toolCalls, tokensUsed, subagents,
+      toolDensity, tokenEff, score, status, statusClass
+    });
+  }
+
+  // Overall stats
+  const totalLlm = deduped.filter(s => s.kind === 'llm_call').length;
+  const totalTools = deduped.filter(s => s.kind === 'tool_call').length;
+  const totalTokens = deduped.reduce((sum, s) => sum + (s.tokensIn || 0) + (s.tokensOut || 0), 0);
+  const totalSubagents = deduped.filter(s => s.kind === 'subagent').length;
+  const avgScore = windows.length ? Math.round(windows.reduce((s, w) => s + w.score, 0) / windows.length) : 0;
+  const overallDensity = (totalTools / Math.max(totalLlm, 1)).toFixed(2);
+  const overallEff = (totalTools / Math.max(totalTokens / 1000, 0.1)).toFixed(2);
+
+  // Score color
+  function scoreColor(s) {
+    if (s === 0) return '#9ca3af';
+    if (s <= 25) return '#dc2626';
+    if (s <= 60) return '#ca8a04';
+    return '#16a34a';
+  }
+
+  // Build chart SVG - area chart of work index over time
+  const chartW = 800, chartH = 180, pad = 40;
+  const plotW = chartW - pad * 2, plotH = chartH - pad * 1.5;
+  let pathD = 'M ' + pad + ' ' + (pad + plotH);
+  const points = [];
+  windows.forEach((w, i) => {
+    const x = pad + (i / Math.max(windows.length - 1, 1)) * plotW;
+    const y = pad + plotH - (w.score / 100) * plotH;
+    points.push({ x, y, w });
+    if (i === 0) pathD += ' L ' + x + ' ' + y;
+    else pathD += ' L ' + x + ' ' + y;
+  });
+  pathD += ' L ' + (pad + plotW) + ' ' + (pad + plotH) + ' Z';
+
+  // Gradient stops based on scores
+  let gradStops = '';
+  windows.forEach((w, i) => {
+    const pct = (i / Math.max(windows.length - 1, 1) * 100).toFixed(1);
+    gradStops += '<stop offset="' + pct + '%" stop-color="' + scoreColor(w.score) + '" stop-opacity="0.3"/>';
+  });
+
+  let svg = '<svg viewBox="0 0 ' + chartW + ' ' + chartH + '">';
+  svg += '<defs><linearGradient id="wiGrad" x1="0" y1="0" x2="1" y2="0">' + gradStops + '</linearGradient></defs>';
+
+  // Grid lines
+  for (let v = 0; v <= 100; v += 25) {
+    const y = pad + plotH - (v / 100) * plotH;
+    svg += '<line x1="' + pad + '" y1="' + y + '" x2="' + (pad + plotW) + '" y2="' + y + '" stroke="#e5e7eb" stroke-dasharray="3,3"/>';
+    svg += '<text x="' + (pad - 6) + '" y="' + (y + 4) + '" text-anchor="end" font-size="10" fill="#9ca3af">' + v + '</text>';
+  }
+
+  // Area
+  svg += '<path d="' + pathD + '" fill="url(#wiGrad)"/>';
+
+  // Line
+  let lineD = '';
+  points.forEach((p, i) => { lineD += (i === 0 ? 'M' : 'L') + ' ' + p.x + ' ' + p.y; });
+  svg += '<path d="' + lineD + '" fill="none" stroke="#2563eb" stroke-width="2"/>';
+
+  // Dots
+  points.forEach(p => {
+    svg += '<circle cx="' + p.x + '" cy="' + p.y + '" r="4" fill="' + scoreColor(p.w.score) + '" stroke="#fff" stroke-width="1.5"/>';
+  });
+
+  // X axis labels (time offsets)
+  windows.forEach((w, i) => {
+    if (i % Math.max(1, Math.floor(windows.length / 6)) !== 0 && i !== windows.length - 1) return;
+    const x = pad + (i / Math.max(windows.length - 1, 1)) * plotW;
+    const t = fmtDur(w.startMs - minStart);
+    svg += '<text x="' + x + '" y="' + (chartH - 5) + '" text-anchor="middle" font-size="10" fill="#9ca3af">' + t + '</text>';
+  });
+
+  svg += '<text x="' + (chartW / 2) + '" y="14" text-anchor="middle" font-size="12" fill="#6b7280" font-weight="600">Work Index over Time</text>';
+  svg += '</svg>';
+
+  // Build HTML
+  let h = '<div class="wi-container">';
+
+  // Score cards
+  h += '<div class="wi-score-card">';
+  h += '<div class="wi-card"><div class="wi-label">Overall Work Index</div><div class="wi-value" style="color:' + scoreColor(avgScore) + '">' + avgScore + '</div><div class="wi-sub">out of 100</div></div>';
+  h += '<div class="wi-card"><div class="wi-label">Tool Density</div><div class="wi-value">' + overallDensity + '</div><div class="wi-sub">tools per LLM call</div></div>';
+  h += '<div class="wi-card"><div class="wi-label">Token Efficiency</div><div class="wi-value">' + overallEff + '</div><div class="wi-sub">tools per 1k tokens</div></div>';
+  h += '<div class="wi-card"><div class="wi-label">Delegation</div><div class="wi-value">' + totalSubagents + '</div><div class="wi-sub">subagents spawned</div></div>';
+  h += '</div>';
+
+  // Chart
+  h += '<div class="wi-chart">' + svg + '</div>';
+
+  // Phase table
+  h += '<table class="wi-phases">';
+  h += '<tr><th>Phase</th><th>Score</th><th>Status</th><th>LLM</th><th>Tools</th><th>Tokens</th><th>Density</th><th></th></tr>';
+  windows.forEach((w, i) => {
+    const timeLabel = fmtDur(w.startMs - minStart) + ' – ' + fmtDur(w.endMs - minStart);
+    h += '<tr>';
+    h += '<td>' + timeLabel + '</td>';
+    h += '<td style="font-weight:700;color:' + scoreColor(w.score) + '">' + w.score + '</td>';
+    h += '<td><span class="wi-status wi-status-' + w.statusClass + '">' + w.status + '</span></td>';
+    h += '<td>' + w.llmCalls + '</td>';
+    h += '<td>' + w.toolCalls + '</td>';
+    h += '<td>' + w.tokensUsed.toLocaleString() + '</td>';
+    h += '<td>' + w.toolDensity.toFixed(1) + '</td>';
+    h += '<td class="wi-bar-cell"><div class="wi-bar-bg"><div class="wi-bar-fill" style="width:' + w.score + '%;background:' + scoreColor(w.score) + '"></div></div></td>';
+    h += '</tr>';
+  });
+  h += '</table>';
+
+  // Legend
+  h += '<div class="summary">';
+  h += '<strong>Work Index</strong> measures agent productivity per time window. ';
+  h += '<span class="wi-status wi-status-high">Working</span> = high tool usage, ';
+  h += '<span class="wi-status wi-status-mid">Planning</span> = moderate activity, ';
+  h += '<span class="wi-status wi-status-low">Spinning</span> = high tokens but few tools, ';
+  h += '<span class="wi-status wi-status-idle">Idle</span> = no activity';
+  h += '</div>';
+
+  h += '</div>';
+  return h;
 }
 
 // Auto-refresh polling

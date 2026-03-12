@@ -24,7 +24,8 @@
   },
   "files": [
     "index.ts",
-    "src/"
+    "src/",
+    "openclaw.plugin.json"
   ],
   "license": "MIT",
   "repository": {
