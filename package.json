@@ -1,6 +1,6 @@
 {
   "name": "openclaw-tracing",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Agent execution tracing plugin for OpenClaw — tree-view CLI + web UI for tool calls, LLM invocations, and sub-agent relationships",
   "type": "module",
   "main": "index.ts",

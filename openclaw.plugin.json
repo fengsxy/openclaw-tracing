@@ -1,5 +1,5 @@
 {
-  "id": "tracing",
+  "id": "openclaw-tracing",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
