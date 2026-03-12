@@ -4,7 +4,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { TraceCollector } from "./src/collector.js";
 import { JsonlTraceWriter } from "./src/storage-jsonl.js";
-import { renderCallTree, renderEntityTree, renderWaterfall } from "./src/viewer-cli.js";
+import { renderCallTree, renderEntityTree, renderWaterfall, renderSummary, renderRecent, renderWorkIndex } from "./src/viewer-cli.js";
 import { createTracingHttpHandler } from "./src/web-viewer.js";
 
 const plugin = {
@@ -102,8 +102,40 @@ const plugin = {
               for (const line of renderWaterfall(spans)) console.log(line);
             }
           });
+
+        // LLM-friendly subcommands
+        program
+          .command("traces:summary")
+          .description("Compact plain-text summary of traces (LLM-friendly)")
+          .option("--date <date>", "Date (YYYY-MM-DD), defaults to today")
+          .action((opts: { date?: string }) => {
+            const dateKey = opts.date ?? new Date().toISOString().slice(0, 10);
+            const spans = writer.readByDate(dateKey);
+            for (const line of renderSummary(spans)) console.log(line);
+          });
+
+        program
+          .command("traces:recent")
+          .description("Recent N steps as compact timeline (LLM-friendly)")
+          .option("--date <date>", "Date (YYYY-MM-DD), defaults to today")
+          .option("--steps <n>", "Number of recent steps to show", "20")
+          .action((opts: { date?: string; steps?: string }) => {
+            const dateKey = opts.date ?? new Date().toISOString().slice(0, 10);
+            const spans = writer.readByDate(dateKey);
+            for (const line of renderRecent(spans, parseInt(opts.steps || "20", 10))) console.log(line);
+          });
+
+        program
+          .command("traces:workindex")
+          .description("Work index per time window (LLM-friendly)")
+          .option("--date <date>", "Date (YYYY-MM-DD), defaults to today")
+          .action((opts: { date?: string }) => {
+            const dateKey = opts.date ?? new Date().toISOString().slice(0, 10);
+            const spans = writer.readByDate(dateKey);
+            for (const line of renderWorkIndex(spans)) console.log(line);
+          });
       },
-      { commands: ["traces"] },
+      { commands: ["traces", "traces:summary", "traces:recent", "traces:workindex"] },
     );
   },
 };

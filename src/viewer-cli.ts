@@ -317,3 +317,214 @@ export function renderWaterfall(spans: TraceSpan[]): string[] {
 
   return lines;
 }
+
+// ── LLM-friendly plain text outputs ──
+
+function dedupeSpansPlain(spans: TraceSpan[]): TraceSpan[] {
+  const best = new Map<string, TraceSpan>();
+  for (const s of spans) {
+    if (!best.has(s.spanId) || s.endMs != null) best.set(s.spanId, s);
+  }
+  return [...best.values()];
+}
+
+function fmtDurPlain(ms: number | undefined): string {
+  if (ms == null) return "-";
+  return ms < 1000 ? ms + "ms" : (ms / 1000).toFixed(1) + "s";
+}
+
+/**
+ * One-shot summary: what the agent did, how well, key stats.
+ * Plain text, no ANSI, compact. Designed for LLM consumption.
+ */
+export function renderSummary(rawSpans: TraceSpan[]): string[] {
+  const spans = dedupeSpansPlain(rawSpans);
+  if (!spans.length) return ["No traces."];
+
+  const lines: string[] = [];
+
+  // Sessions
+  const sessions = spans.filter((s) => s.kind === "session");
+  const llmCalls = spans.filter((s) => s.kind === "llm_call");
+  const toolCalls = spans.filter((s) => s.kind === "tool_call");
+  const tokIn = spans.reduce((s, x) => s + (x.tokensIn || 0), 0);
+  const tokOut = spans.reduce((s, x) => s + (x.tokensOut || 0), 0);
+
+  // Duration
+  const minStart = Math.min(...spans.map((s) => s.startMs));
+  const maxEnd = Math.max(...spans.map((s) => s.endMs || s.startMs));
+  const totalDur = maxEnd - minStart;
+
+  // Session keys → entities
+  const entityKeys = new Set(spans.map((s) => s.sessionKey).filter(Boolean));
+  const mainSessions = [...entityKeys].filter((k) => !k!.includes(":subagent:"));
+  const subSessions = [...entityKeys].filter((k) => k!.includes(":subagent:"));
+
+  lines.push("=== Trace Summary ===");
+  lines.push(`Duration: ${fmtDurPlain(totalDur)}`);
+  lines.push(`Entities: ${entityKeys.size} (${mainSessions.length} main, ${subSessions.length} subagents)`);
+  lines.push(`LLM calls: ${llmCalls.length} | Tokens: ${tokIn.toLocaleString()} in, ${tokOut.toLocaleString()} out`);
+  lines.push(`Tool calls: ${toolCalls.length}`);
+
+  // Top tools
+  const toolCounts = new Map<string, number>();
+  for (const s of toolCalls) {
+    const name = s.toolName || s.name;
+    toolCounts.set(name, (toolCounts.get(name) || 0) + 1);
+  }
+  const topTools = [...toolCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([name, count]) => `${name}(${count})`)
+    .join(" ");
+  if (topTools) lines.push(`Top tools: ${topTools}`);
+
+  // Models
+  const models = new Set(llmCalls.map((s) => s.model).filter(Boolean));
+  if (models.size) lines.push(`Models: ${[...models].join(", ")}`);
+
+  // Subagent labels
+  if (subSessions.length) {
+    const labels = subSessions.map((sk) => {
+      const uuid = sk!.split(":subagent:")[1] || "";
+      const spawnCall = toolCalls.find(
+        (s) => s.toolName === "sessions_spawn" && s.toolParams && JSON.stringify(s.toolParams).includes(uuid),
+      );
+      if (spawnCall?.toolParams && typeof spawnCall.toolParams.label === "string") {
+        return spawnCall.toolParams.label;
+      }
+      return "subagent:" + uuid.slice(0, 8);
+    });
+    lines.push(`Subagents: ${labels.join(", ")}`);
+  }
+
+  // Work Index
+  const toolDensity = toolCalls.length / Math.max(llmCalls.length, 1);
+  const tokenEff = toolCalls.length / Math.max((tokIn + tokOut) / 1000, 0.1);
+  let score = 0;
+  if (llmCalls.length > 0 || toolCalls.length > 0) {
+    score = Math.min(
+      100,
+      Math.round(
+        (Math.min(toolDensity, 5) / 5) * 50 +
+          (Math.min(tokenEff, 3) / 3) * 30 +
+          (subSessions.length > 0 ? 20 : 0),
+      ),
+    );
+    if (llmCalls.length > 0 && toolCalls.length === 0) score = Math.min(score, 15);
+  }
+  let status = "Idle";
+  if (score > 60) status = "Working";
+  else if (score > 25) status = "Planning";
+  else if (score > 0) status = "Spinning";
+  lines.push(`Work Index: ${score}/100 (${status}) | Density: ${toolDensity.toFixed(1)} tools/llm | Efficiency: ${tokenEff.toFixed(1)} tools/1k-tok`);
+
+  // Errors
+  const errors = spans.filter((s) => s.attributes?.error || s.attributes?.outcome === "error");
+  if (errors.length) {
+    lines.push(`Errors: ${errors.length}`);
+    for (const e of errors.slice(0, 5)) {
+      const name = e.toolName || e.name || e.kind;
+      const msg = typeof e.attributes?.error === "string" ? e.attributes.error : "";
+      lines.push(`  - ${name}: ${msg.slice(0, 100)}`);
+    }
+  }
+
+  return lines;
+}
+
+/**
+ * Recent N steps as a compact timeline. Plain text for LLM.
+ */
+export function renderRecent(rawSpans: TraceSpan[], steps: number = 20): string[] {
+  const spans = dedupeSpansPlain(rawSpans);
+  if (!spans.length) return ["No traces."];
+
+  // Sort by startMs, take the most recent N non-session spans
+  const actionSpans = spans
+    .filter((s) => s.kind !== "session")
+    .sort((a, b) => a.startMs - b.startMs);
+
+  const recent = actionSpans.slice(-steps);
+  if (!recent.length) return ["No action spans."];
+
+  const baseTime = recent[0].startMs;
+  const lines: string[] = [`=== Recent ${recent.length} steps ===`];
+
+  for (const s of recent) {
+    const offset = fmtDurPlain(s.startMs - baseTime);
+    const dur = fmtDurPlain(s.durationMs);
+
+    if (s.kind === "llm_call") {
+      const model = (s.model || "?").split("/").pop() || "?";
+      const tok = `${s.tokensIn || 0}+${s.tokensOut || 0}tok`;
+      lines.push(`[${offset}] llm ${model} → ${dur}, ${tok}`);
+    } else if (s.kind === "tool_call") {
+      const name = s.toolName || s.name;
+      let params = "";
+      if (s.toolParams) {
+        const entries = Object.entries(s.toolParams).slice(0, 3);
+        params = entries
+          .map(([k, v]) => {
+            const vs = typeof v === "string" ? v : JSON.stringify(v);
+            return `${k}=${vs.length > 40 ? vs.slice(0, 37) + "..." : vs}`;
+          })
+          .join(" ");
+        if (params) params = " " + params;
+      }
+      lines.push(`[${offset}] tool ${name}${params} → ${dur}`);
+    } else if (s.kind === "subagent") {
+      lines.push(`[${offset}] spawn ${s.childAgentId || "?"} → ${dur}`);
+    }
+  }
+
+  return lines;
+}
+
+/**
+ * Work Index per time window. Plain text for LLM.
+ */
+export function renderWorkIndex(rawSpans: TraceSpan[]): string[] {
+  const spans = dedupeSpansPlain(rawSpans);
+  if (!spans.length) return ["No traces."];
+
+  const minStart = Math.min(...spans.map((s) => s.startMs));
+  const maxEnd = Math.max(...spans.map((s) => s.endMs || s.startMs));
+  const totalDuration = maxEnd - minStart || 1;
+
+  const windowSize = Math.max(5000, totalDuration / 10);
+  const lines: string[] = ["=== Work Index ==="];
+  lines.push("Phase         | Score | Status   | LLM | Tools | Tokens");
+  lines.push("--------------|-------|----------|-----|-------|-------");
+
+  for (let t = minStart; t < maxEnd; t += windowSize) {
+    const wEnd = Math.min(t + windowSize, maxEnd);
+    const wSpans = spans.filter((s) => s.startMs < wEnd && (s.endMs || s.startMs) > t);
+    const llm = wSpans.filter((s) => s.kind === "llm_call").length;
+    const tools = wSpans.filter((s) => s.kind === "tool_call").length;
+    const tokens = wSpans.reduce((sum, s) => sum + (s.tokensIn || 0) + (s.tokensOut || 0), 0);
+    const subs = wSpans.filter((s) => s.kind === "subagent").length;
+
+    const density = tools / Math.max(llm, 1);
+    const eff = tools / Math.max(tokens / 1000, 0.1);
+    let score = 0;
+    if (llm > 0 || tools > 0) {
+      score = Math.min(100, Math.round(
+        (Math.min(density, 5) / 5) * 50 + (Math.min(eff, 3) / 3) * 30 + (subs > 0 ? 20 : 0),
+      ));
+      if (llm > 0 && tools === 0) score = Math.min(score, 15);
+    }
+
+    let status = "Idle";
+    if (score > 60) status = "Working";
+    else if (score > 25) status = "Planning";
+    else if (score > 0) status = "Spinning";
+
+    const phase = fmtDurPlain(t - minStart) + "-" + fmtDurPlain(wEnd - minStart);
+    lines.push(
+      `${phase.padEnd(14)}| ${String(score).padStart(5)} | ${status.padEnd(8)} | ${String(llm).padStart(3)} | ${String(tools).padStart(5)} | ${tokens.toLocaleString()}`,
+    );
+  }
+
+  return lines;
+}
