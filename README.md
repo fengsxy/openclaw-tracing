@@ -306,6 +306,127 @@ Then register as a Hive table in Glue for Athena access — simpler setup, works
 | Athena queries | < $0.10 (Parquet is compressed) |
 | **Total** | **< $0.15/month** |
 
+### PuppyGraph (optional)
+
+[PuppyGraph](https://www.puppygraph.com/) turns your trace data into a queryable graph — zero ETL, directly on DuckDB. Visualize agent-tool-model relationships and run Cypher/Gremlin graph queries.
+
+**Graph model:**
+
+```
+Session (agent/subagent)  --uses_tool-->   Tool (Read, Exec, Grep...)
+Session                   --uses_model-->  Model (claude-opus-4-6...)
+Session                   --spawns-->      Session (parent → child)
+```
+
+**Setup:**
+
+```bash
+# 1. Start PuppyGraph (needs Docker, ~4G RAM recommended)
+docker run -p 8081:8081 -p 8182:8182 -p 7687:7687 \
+  -v puppygraph-data:/home/share \
+  -e PUPPYGRAPH_PASSWORD=puppygraph123 \
+  -d --name puppygraph --rm --pull=always \
+  puppygraph/puppygraph:stable
+
+# 2. Prepare graph data in DuckDB
+# Export your traces to a DuckDB file with graph tables:
+duckdb /path/to/share/graph.db << 'SQL'
+  -- Import trace spans
+  CREATE TABLE spans AS SELECT * FROM read_json('~/.openclaw/traces/*.jsonl',
+    format='newline_delimited', union_by_name=true, columns={
+      traceId:'VARCHAR', spanId:'VARCHAR', parentSpanId:'VARCHAR',
+      kind:'VARCHAR', name:'VARCHAR', agentId:'VARCHAR',
+      sessionKey:'VARCHAR', startMs:'BIGINT', endMs:'BIGINT',
+      durationMs:'BIGINT', toolName:'VARCHAR', toolParams:'VARCHAR',
+      provider:'VARCHAR', model:'VARCHAR',
+      tokensIn:'BIGINT', tokensOut:'BIGINT'
+    });
+
+  -- Vertex: sessions (agents/subagents)
+  CREATE TABLE sessions AS SELECT DISTINCT session_key AS id, agent_id, session_key,
+    CASE WHEN session_key LIKE '%subagent%' THEN 'subagent' ELSE 'main' END AS agent_type,
+    CAST(COUNT(*) FILTER (WHERE kind='llm_call') AS BIGINT) AS llm_call_count,
+    CAST(COUNT(*) FILTER (WHERE kind='tool_call') AS BIGINT) AS tool_call_count,
+    CAST(COALESCE(SUM(tokens_in),0) AS BIGINT) AS total_tokens_in,
+    CAST(COALESCE(SUM(tokens_out),0) AS BIGINT) AS total_tokens_out
+  FROM spans WHERE session_key IS NOT NULL GROUP BY session_key, agent_id;
+
+  -- Vertex: tools
+  CREATE TABLE tools AS SELECT tool_name AS id, tool_name AS name,
+    CAST(COUNT(*) AS BIGINT) AS call_count,
+    CAST(COALESCE(ROUND(AVG(duration_ms)),0) AS BIGINT) AS avg_duration_ms
+  FROM spans WHERE kind='tool_call' AND tool_name IS NOT NULL GROUP BY tool_name;
+
+  -- Vertex: models
+  CREATE TABLE models AS SELECT model AS id, model AS name, MAX(provider) AS provider,
+    CAST(COUNT(*) AS BIGINT) AS call_count,
+    CAST(COALESCE(SUM(tokens_in),0) AS BIGINT) AS total_tokens_in,
+    CAST(COALESCE(SUM(tokens_out),0) AS BIGINT) AS total_tokens_out
+  FROM spans WHERE kind='llm_call' AND model IS NOT NULL GROUP BY model;
+
+  -- Edge: session → tool
+  CREATE TABLE session_uses_tool AS SELECT session_key||'::'||tool_name AS id,
+    session_key AS from_id, tool_name AS to_id,
+    CAST(COUNT(*) AS BIGINT) AS call_count,
+    CAST(COALESCE(SUM(duration_ms),0) AS BIGINT) AS total_duration_ms
+  FROM spans WHERE kind='tool_call' AND tool_name IS NOT NULL AND session_key IS NOT NULL
+  GROUP BY session_key, tool_name;
+
+  -- Edge: session → model
+  CREATE TABLE session_uses_model AS SELECT session_key||'::'||model AS id,
+    session_key AS from_id, model AS to_id,
+    CAST(COUNT(*) AS BIGINT) AS call_count,
+    CAST(COALESCE(SUM(tokens_in),0) AS BIGINT) AS total_tokens_in
+  FROM spans WHERE kind='llm_call' AND model IS NOT NULL AND session_key IS NOT NULL
+  GROUP BY session_key, model;
+
+  -- Edge: session spawns session
+  CREATE TABLE session_spawns_session AS SELECT from_sk||'::spawns::'||to_sk AS id,
+    from_sk AS from_id, to_sk AS to_id
+  FROM (SELECT DISTINCT s1.session_key AS from_sk, s2.session_key AS to_sk
+    FROM spans s1 JOIN spans s2 ON s2.parent_span_id = s1.span_id
+    WHERE s1.kind='session' AND s2.kind='session'
+    AND s1.session_key != s2.session_key);
+SQL
+
+# 3. Upload schema to PuppyGraph
+curl -XPOST -H 'content-type: application/json' \
+  -d @schema.json \
+  --user 'puppygraph:puppygraph123' \
+  http://localhost:8081/schema
+```
+
+The `schema.json` file is included in the [`puppygraph/`](./puppygraph/) directory of this repo.
+
+**Cypher queries:**
+
+```cypher
+-- Full graph visualization
+MATCH (n)-[e]->(m) RETURN n, e, m LIMIT 100
+
+-- Agent → Tool usage (top 10)
+MATCH (s:session)-[u:uses_tool]->(t:tool)
+RETURN s, u, t ORDER BY u.call_count DESC LIMIT 10
+
+-- Subagent spawn chain
+MATCH (parent:session)-[:spawns]->(child:session)
+RETURN parent, child
+
+-- 2-hop: main agent → subagent → tools
+MATCH (main:session)-[:spawns]->(sub:session)-[u:uses_tool]->(t:tool)
+RETURN main.session_key, sub.session_key, t.name, u.call_count
+
+-- Which tools are shared across most agents?
+MATCH (s:session)-[:uses_tool]->(t:tool)
+RETURN t.name, count(s) AS used_by ORDER BY used_by DESC
+
+-- Agent → Model usage
+MATCH (s:session)-[u:uses_model]->(m:model)
+RETURN s, u, m
+```
+
+**Web UI:** Open `http://localhost:8081`, login with `puppygraph` / `puppygraph123`.
+
 ## Work Index
 
 The Work Index (0-100) measures agent productivity per time window:
