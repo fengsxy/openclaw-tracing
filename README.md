@@ -115,11 +115,38 @@ Traces are stored as JSONL files in `~/.openclaw/traces/YYYY-MM-DD.jsonl`, auto-
 
 ### DuckDB (optional)
 
-When DuckDB is installed, `traces:query` auto-imports all JSONL files into `~/.openclaw/traces/traces.duckdb` on first run. This gives you:
+DuckDB adds embedded SQL analytics — no external database needed, just one npm package.
 
-- Full SQL analytics on trace data
-- Parquet export for data pipelines
-- Fast aggregation queries across days
+**Setup:**
+
+```bash
+cd ~/.openclaw/extensions/openclaw-tracing
+npm install @duckdb/node-api
+openclaw gateway restart
+```
+
+**How it works:**
+
+- First time you run `traces:query`, all JSONL files are auto-imported into `~/.openclaw/traces/traces.duckdb`
+- Subsequent queries run directly against DuckDB (fast, no re-import)
+- Data schema: `spans` table with columns `trace_id`, `span_id`, `kind`, `tool_name`, `model`, `tokens_in`, `tokens_out`, `duration_ms`, `session_key`, etc.
+
+**CLI commands:**
+
+```bash
+# Run any SQL query
+openclaw traces:query "SELECT tool_name, COUNT(*) as cnt FROM spans WHERE kind='tool_call' GROUP BY tool_name ORDER BY cnt DESC LIMIT 10"
+
+# Output as JSON (for programmatic use)
+openclaw traces:query "SELECT model, SUM(tokens_in) as total FROM spans WHERE kind='llm_call' GROUP BY model" --format json
+
+# Output as CSV
+openclaw traces:query "..." --format csv
+
+# Export to Parquet file
+openclaw traces:export
+openclaw traces:export --date 2026-03-12 --output /tmp/traces.parquet
+```
 
 **Useful queries:**
 
@@ -137,10 +164,147 @@ SELECT session_key, COUNT(*) FILTER (WHERE kind='tool_call') as tools,
        COUNT(*) FILTER (WHERE kind='llm_call') as llm_calls
 FROM spans GROUP BY session_key;
 
--- Work index: are we spinning or working?
-SELECT tool_name IS NOT NULL as has_tool, COUNT(*), AVG(duration_ms)
-FROM spans WHERE kind IN ('llm_call','tool_call') GROUP BY 1;
+-- Model cost comparison
+SELECT model, COUNT(*) as calls,
+       ROUND(SUM(tokens_in)/1000000.0, 1) as mtok_in,
+       ROUND(SUM(tokens_out)/1000000.0, 1) as mtok_out
+FROM spans WHERE kind='llm_call' GROUP BY model ORDER BY mtok_in DESC;
+
+-- Find spinning phases (high tokens, low tool usage)
+SELECT CAST(epoch_ms(start_ms) AS DATE) as day,
+       COUNT(*) FILTER (WHERE kind='llm_call') as llm,
+       COUNT(*) FILTER (WHERE kind='tool_call') as tools,
+       ROUND(COUNT(*) FILTER (WHERE kind='tool_call')::FLOAT /
+             NULLIF(COUNT(*) FILTER (WHERE kind='llm_call'), 0), 1) as density
+FROM spans GROUP BY day ORDER BY day;
 ```
+
+### Apache Iceberg (optional)
+
+For production-scale analytics, team-wide querying, or integration with data platforms (Athena, Spark, Trino, Snowflake), traces can be synced to Apache Iceberg tables on AWS.
+
+**Architecture:**
+
+```
+JSONL → DuckDB → Parquet → S3 → Glue Catalog (Iceberg) → Athena / Spark / Trino
+```
+
+**Prerequisites:**
+
+- AWS account with S3 + Glue + Athena permissions
+- DuckDB installed in the plugin (see above)
+
+**Step 1: Create AWS resources**
+
+```bash
+# Create S3 bucket for trace data
+aws s3 mb s3://your-traces-bucket --region us-east-1
+
+# Create Glue database
+aws glue create-database \
+  --database-input '{"Name":"openclaw_traces"}' \
+  --region us-east-1
+
+# Create Iceberg table in Glue
+aws glue create-table --database-name openclaw_traces --region us-east-1 \
+  --open-table-format-input '{"IcebergInput":{"MetadataOperation":"CREATE","Version":"2"}}' \
+  --table-input '{
+    "Name": "spans",
+    "StorageDescriptor": {
+      "Columns": [
+        {"Name": "trace_id", "Type": "string"},
+        {"Name": "span_id", "Type": "string"},
+        {"Name": "parent_span_id", "Type": "string"},
+        {"Name": "kind", "Type": "string"},
+        {"Name": "name", "Type": "string"},
+        {"Name": "agent_id", "Type": "string"},
+        {"Name": "session_key", "Type": "string"},
+        {"Name": "start_ms", "Type": "bigint"},
+        {"Name": "end_ms", "Type": "bigint"},
+        {"Name": "duration_ms", "Type": "bigint"},
+        {"Name": "tool_name", "Type": "string"},
+        {"Name": "tool_params", "Type": "string"},
+        {"Name": "provider", "Type": "string"},
+        {"Name": "model", "Type": "string"},
+        {"Name": "tokens_in", "Type": "bigint"},
+        {"Name": "tokens_out", "Type": "bigint"},
+        {"Name": "trace_date", "Type": "string"}
+      ],
+      "Location": "s3://your-traces-bucket/iceberg/spans/",
+      "InputFormat": "org.apache.hadoop.mapred.FileInputFormat",
+      "OutputFormat": "org.apache.hadoop.mapred.FileOutputFormat",
+      "SerdeInfo": {"SerializationLibrary": "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"}
+    },
+    "TableType": "EXTERNAL_TABLE"
+  }'
+```
+
+**Step 2: Sync traces to Iceberg**
+
+DuckDB connects to Glue's Iceberg REST API directly:
+
+```bash
+openclaw traces:query "
+  INSTALL iceberg; LOAD iceberg;
+  INSTALL aws; LOAD aws;
+
+  -- Configure AWS credentials
+  CREATE SECRET (TYPE S3, KEY_ID 'YOUR_KEY', SECRET 'YOUR_SECRET', REGION 'us-east-1');
+
+  -- Attach Glue Iceberg catalog (use your AWS account ID as warehouse)
+  ATTACH 'YOUR_ACCOUNT_ID' AS lake (
+    TYPE ICEBERG,
+    ENDPOINT 'glue.us-east-1.amazonaws.com/iceberg',
+    AUTHORIZATION_TYPE sigv4
+  );
+
+  -- Insert traces into Iceberg
+  INSERT INTO lake.openclaw_traces.spans
+  SELECT trace_id, span_id, parent_span_id, kind, name, agent_id, session_key,
+         start_ms, end_ms, duration_ms, tool_name, tool_params,
+         provider, model, tokens_in, tokens_out,
+         CAST(epoch_ms(start_ms) AS DATE)::VARCHAR as trace_date
+  FROM spans;
+"
+```
+
+**Step 3: Query with Athena**
+
+Once data is in Iceberg, query it from AWS Console → Athena:
+
+```sql
+-- Total tokens by model this week
+SELECT model, SUM(tokens_in) as total_tokens
+FROM openclaw_traces.spans
+WHERE trace_date >= '2026-03-10'
+GROUP BY model;
+
+-- Iceberg time travel: compare today vs yesterday
+SELECT * FROM openclaw_traces.spans FOR VERSION AS OF 1;
+```
+
+**Alternative: Parquet on S3 (simpler)**
+
+If you don't need full Iceberg features (ACID, time travel), you can export partitioned Parquet directly:
+
+```bash
+openclaw traces:query "
+  INSTALL httpfs; LOAD httpfs;
+  CREATE SECRET (TYPE S3, KEY_ID 'YOUR_KEY', SECRET 'YOUR_SECRET', REGION 'us-east-1');
+  COPY spans TO 's3://your-bucket/traces/data.parquet' (FORMAT PARQUET);
+"
+```
+
+Then register as a Hive table in Glue for Athena access — simpler setup, works for most use cases.
+
+**Cost estimate (AWS):**
+
+| Component | Monthly cost (typical) |
+|-----------|----------------------|
+| S3 storage | < $0.01 (traces are small) |
+| Glue Catalog | Free (first 1M requests) |
+| Athena queries | < $0.10 (Parquet is compressed) |
+| **Total** | **< $0.15/month** |
 
 ## Work Index
 
