@@ -57,6 +57,79 @@ const plugin = {
 
     api.logger.info("[tracing] hooks registered OK");
 
+    // /traces command — users can type /traces in chat
+    api.registerCommand({
+      name: "traces",
+      description: "Show agent trace summary, recent activity, or run SQL query",
+      acceptsArgs: true,
+      handler: async (ctx) => {
+        const args = (ctx.args?.trim() ?? "");
+        const dateKey = new Date().toISOString().slice(0, 10);
+        const spans = writer.readByDate(dateKey);
+
+        if (!args || args === "summary") {
+          return renderSummary(spans).join("\n");
+        } else if (args === "recent") {
+          return renderRecent(spans, 15).join("\n");
+        } else if (args === "workindex") {
+          return renderWorkIndex(spans).join("\n");
+        } else if (args.startsWith("sql ")) {
+          // SQL query via DuckDB
+          try {
+            const { DuckDBInstance } = await import("@duckdb/node-api");
+            const fs = await import("node:fs");
+            const dbPath = path.join(traceDir, "traces.duckdb");
+            const needsImport = !fs.existsSync(dbPath);
+            const db = await DuckDBInstance.create(dbPath);
+            const conn = await db.connect();
+            await conn.run(`CREATE TABLE IF NOT EXISTS spans (
+              trace_id VARCHAR, span_id VARCHAR, parent_span_id VARCHAR,
+              kind VARCHAR, name VARCHAR, agent_id VARCHAR, session_key VARCHAR,
+              start_ms BIGINT, end_ms BIGINT, duration_ms BIGINT,
+              tool_name VARCHAR, tool_params JSON, child_session_key VARCHAR,
+              child_agent_id VARCHAR, provider VARCHAR, model VARCHAR,
+              tokens_in BIGINT, tokens_out BIGINT, attributes JSON
+            )`);
+            if (needsImport) {
+              const files = fs.readdirSync(traceDir).filter((f: string) => f.endsWith(".jsonl"));
+              for (const f of files) {
+                try {
+                  await conn.run(`INSERT INTO spans SELECT
+                    traceId, spanId, parentSpanId, kind, name,
+                    agentId, sessionKey, startMs, endMs, durationMs,
+                    toolName, toolParams, childSessionKey, childAgentId,
+                    provider, model, tokensIn, tokensOut, attributes
+                  FROM read_json('${path.join(traceDir, f)}', format='newline_delimited', columns={
+                    traceId:'VARCHAR', spanId:'VARCHAR', parentSpanId:'VARCHAR',
+                    kind:'VARCHAR', name:'VARCHAR', agentId:'VARCHAR',
+                    sessionKey:'VARCHAR', startMs:'BIGINT', endMs:'BIGINT',
+                    durationMs:'BIGINT', toolName:'VARCHAR', toolParams:'JSON',
+                    childSessionKey:'VARCHAR', childAgentId:'VARCHAR',
+                    provider:'VARCHAR', model:'VARCHAR',
+                    tokensIn:'BIGINT', tokensOut:'BIGINT', attributes:'JSON'
+                  })`);
+                } catch { /* skip */ }
+              }
+            }
+            const sql = args.slice(4).trim();
+            const result = await conn.runAndReadAll(sql);
+            const cols = result.columnNames() as string[];
+            const rows = result.getRows() as unknown[][];
+            if (!rows.length) return "(no results)";
+            const lines = [cols.join(" | ")];
+            for (const row of rows) {
+              lines.push(row.map(v => typeof v === "bigint" ? Number(v) : v ?? "").join(" | "));
+            }
+            return lines.join("\n");
+          } catch (e: any) {
+            return "Query error: " + e.message;
+          }
+        } else {
+          return "Usage: /traces [summary|recent|workindex|sql <query>]";
+        }
+      },
+    });
+
     // Web UI at /plugins/tracing
     api.registerHttpRoute({
       path: "/plugins/tracing",
