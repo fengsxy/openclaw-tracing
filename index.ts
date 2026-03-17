@@ -134,8 +134,153 @@ const plugin = {
             const spans = writer.readByDate(dateKey);
             for (const line of renderWorkIndex(spans)) console.log(line);
           });
+
+        program
+          .command("traces:query")
+          .description("Run SQL query against trace data using DuckDB")
+          .argument("<sql>", "SQL query to execute")
+          .option("--format <fmt>", "Output format: table, csv, json", "table")
+          .action(async (sql: string, opts: { format?: string }) => {
+            try {
+              const { DuckDBInstance } = await import("@duckdb/node-api");
+              const dbPath = path.join(traceDir, "traces.duckdb");
+
+              // Check if duckdb file exists, if not import JSONL first
+              const fs = await import("node:fs");
+              const needsImport = !fs.existsSync(dbPath);
+
+              const db = await DuckDBInstance.create(dbPath);
+              const conn = await db.connect();
+
+              // Create table if needed
+              await conn.run(`
+                CREATE TABLE IF NOT EXISTS spans (
+                  trace_id VARCHAR, span_id VARCHAR, parent_span_id VARCHAR,
+                  kind VARCHAR, name VARCHAR, agent_id VARCHAR, session_key VARCHAR,
+                  start_ms BIGINT, end_ms BIGINT, duration_ms BIGINT,
+                  tool_name VARCHAR, tool_params JSON, child_session_key VARCHAR,
+                  child_agent_id VARCHAR, provider VARCHAR, model VARCHAR,
+                  tokens_in BIGINT, tokens_out BIGINT, attributes JSON
+                )
+              `);
+
+              // Auto-import JSONL if db is fresh
+              if (needsImport) {
+                const files = fs.readdirSync(traceDir).filter((f: string) => f.endsWith(".jsonl"));
+                for (const f of files) {
+                  const filePath = path.join(traceDir, f);
+                  try {
+                    await conn.run(`
+                      INSERT INTO spans SELECT
+                        traceId, spanId, parentSpanId, kind, name,
+                        agentId, sessionKey, startMs, endMs, durationMs,
+                        toolName, toolParams, childSessionKey, childAgentId,
+                        provider, model, tokensIn, tokensOut, attributes
+                      FROM read_json('${filePath}', format='newline_delimited', columns={
+                        traceId:'VARCHAR', spanId:'VARCHAR', parentSpanId:'VARCHAR',
+                        kind:'VARCHAR', name:'VARCHAR', agentId:'VARCHAR',
+                        sessionKey:'VARCHAR', startMs:'BIGINT', endMs:'BIGINT',
+                        durationMs:'BIGINT', toolName:'VARCHAR', toolParams:'JSON',
+                        childSessionKey:'VARCHAR', childAgentId:'VARCHAR',
+                        provider:'VARCHAR', model:'VARCHAR',
+                        tokensIn:'BIGINT', tokensOut:'BIGINT', attributes:'JSON'
+                      })
+                    `);
+                  } catch {
+                    // skip malformed files
+                  }
+                }
+                console.log(`Imported ${files.length} trace files into DuckDB.`);
+              }
+
+              // Execute query
+              const result = await conn.runAndReadAll(sql);
+              const cols = result.columnNames() as string[];
+              const rows = result.getRows() as unknown[][];
+
+              if (!rows.length) {
+                console.log("(no results)");
+                return;
+              }
+
+              const fmt = opts.format || "table";
+
+              // Convert BigInt to Number for serialization
+              const normalize = (v: unknown) => typeof v === "bigint" ? Number(v) : v;
+
+              if (fmt === "json") {
+                const jsonRows = rows.map(row => {
+                  const obj: Record<string, unknown> = {};
+                  cols.forEach((c, i) => { obj[c] = normalize(row[i]); });
+                  return obj;
+                });
+                console.log(JSON.stringify(jsonRows, null, 2));
+              } else if (fmt === "csv") {
+                console.log(cols.join(","));
+                for (const row of rows) {
+                  console.log(row.map(v => v == null ? "" : String(v)).join(","));
+                }
+              } else {
+                // table format
+                const widths = cols.map((c, i) => {
+                  const maxVal = Math.max(...rows.map(r => String(r[i] ?? "").length));
+                  return Math.max(c.length, Math.min(maxVal, 40));
+                });
+                const header = cols.map((c, i) => c.padEnd(widths[i])).join(" | ");
+                const sep = widths.map(w => "-".repeat(w)).join("-+-");
+                console.log(header);
+                console.log(sep);
+                for (const row of rows) {
+                  const line = row.map((v, i) => {
+                    const s = String(v ?? "");
+                    return (s.length > 40 ? s.slice(0, 37) + "..." : s).padEnd(widths[i]);
+                  }).join(" | ");
+                  console.log(line);
+                }
+                console.log(`\n${rows.length} row(s)`);
+              }
+            } catch (e: any) {
+              if (e.code === "ERR_MODULE_NOT_FOUND" || e.message?.includes("duckdb")) {
+                console.error("DuckDB not installed. Run: npm install @duckdb/node-api");
+              } else {
+                console.error("Query error:", e.message);
+              }
+            }
+          });
+
+        program
+          .command("traces:export")
+          .description("Export traces to Parquet format")
+          .option("--date <date>", "Export specific date only")
+          .option("--output <path>", "Output file path", path.join(traceDir, "traces.parquet"))
+          .action(async (opts: { date?: string; output?: string }) => {
+            try {
+              const { DuckDBInstance } = await import("@duckdb/node-api");
+              const dbPath = path.join(traceDir, "traces.duckdb");
+              const fs = await import("node:fs");
+
+              if (!fs.existsSync(dbPath)) {
+                console.error("No DuckDB database found. Run traces:query first to import data.");
+                return;
+              }
+
+              const db = await DuckDBInstance.create(dbPath);
+              const conn = await db.connect();
+
+              const outPath = opts.output || path.join(traceDir, "traces.parquet");
+              const dateFilter = opts.date
+                ? `WHERE CAST(epoch_ms(start_ms) AS DATE) = '${opts.date}'`
+                : "";
+
+              await conn.run(`COPY (SELECT * FROM spans ${dateFilter} ORDER BY start_ms) TO '${outPath}' (FORMAT PARQUET)`);
+              const size = fs.statSync(outPath).size;
+              console.log(`Exported to ${outPath} (${(size / 1024).toFixed(1)} KB)`);
+            } catch (e: any) {
+              console.error("Export error:", e.message);
+            }
+          });
       },
-      { commands: ["traces", "traces:summary", "traces:recent", "traces:workindex"] },
+      { commands: ["traces", "traces:summary", "traces:recent", "traces:workindex", "traces:query", "traces:export"] },
     );
   },
 };
