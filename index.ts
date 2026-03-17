@@ -8,7 +8,7 @@ import { renderCallTree, renderEntityTree, renderWaterfall, renderSummary, rende
 import { createTracingHttpHandler } from "./src/web-viewer.js";
 
 const plugin = {
-  id: "tracing",
+  id: "openclaw-tracing",
   name: "Agent Tracing",
   description: "Trace tool calls, LLM invocations, and sub-agent relationships",
   configSchema: emptyPluginConfigSchema(),
@@ -68,11 +68,11 @@ const plugin = {
         const spans = writer.readByDate(dateKey);
 
         if (!args || args === "summary") {
-          return renderSummary(spans).join("\n");
+          return { text: renderSummary(spans).join("\n") };
         } else if (args === "recent") {
-          return renderRecent(spans, 15).join("\n");
+          return { text: renderRecent(spans, 15).join("\n") };
         } else if (args === "workindex") {
-          return renderWorkIndex(spans).join("\n");
+          return { text: renderWorkIndex(spans).join("\n") };
         } else if (args.startsWith("sql ")) {
           // SQL query via DuckDB
           try {
@@ -115,17 +115,17 @@ const plugin = {
             const result = await conn.runAndReadAll(sql);
             const cols = result.columnNames() as string[];
             const rows = result.getRows() as unknown[][];
-            if (!rows.length) return "(no results)";
+            if (!rows.length) return { text: "(no results)" };
             const lines = [cols.join(" | ")];
             for (const row of rows) {
               lines.push(row.map(v => typeof v === "bigint" ? Number(v) : v ?? "").join(" | "));
             }
-            return lines.join("\n");
+            return { text: lines.join("\n") };
           } catch (e: any) {
-            return "Query error: " + e.message;
+            return { text: "Query error: " + e.message };
           }
         } else {
-          return "Usage: /traces [summary|recent|workindex|sql <query>]";
+          return { text: "Usage: /traces [summary|recent|workindex|sql <query>]" };
         }
       },
     });
