@@ -31,3 +31,4 @@ features:
     title: Zero Infrastructure
     details: JSONL by default, DuckDB optional, Iceberg & PuppyGraph for scale. Start simple, grow as needed.
 ---
+
