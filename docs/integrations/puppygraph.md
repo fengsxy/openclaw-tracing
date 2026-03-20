@@ -2,6 +2,8 @@
 
 [PuppyGraph](https://www.puppygraph.com/) turns your trace data into a queryable graph — zero ETL, directly on DuckDB. Visualize agent-tool-model relationships with Cypher or Gremlin queries.
 
+![PuppyGraph Schema](/screenshots/puppygraph-home.png)
+
 ## Graph model
 
 ```

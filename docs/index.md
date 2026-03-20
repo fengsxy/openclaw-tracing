@@ -32,3 +32,20 @@ features:
     details: JSONL by default, DuckDB optional, Iceberg & PuppyGraph for scale. Start simple, grow as needed.
 ---
 
+## Screenshots
+
+### Call Tree
+Nested execution hierarchy with collapsible tool groups and new-span highlighting.
+
+![Call Tree](/screenshots/call-tree.png)
+
+### Entity Graph
+Force-directed visualization of agent-tool-model relationships.
+
+![Entity Graph](/screenshots/entity-graph.png)
+
+### Work Index
+Agent productivity scoring with time-series chart and phase breakdown.
+
+![Work Index](/screenshots/work-index.png)
+
