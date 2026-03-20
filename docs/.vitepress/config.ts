@@ -23,6 +23,7 @@ export default defineConfig({
           { text: 'CLI Commands', link: '/guide/cli' },
           { text: 'Chat Commands', link: '/guide/chat-commands' },
           { text: 'Work Index', link: '/guide/work-index' },
+          { text: 'Use Cases', link: '/guide/use-cases' },
         ],
       },
       {
