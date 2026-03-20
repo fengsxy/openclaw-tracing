@@ -16,6 +16,10 @@ Graph: 31 vertices, 70 edges
 └── 6 spawns edges
 ```
 
+Here's the full graph — every agent, tool, and model connected:
+
+![Full Graph in PuppyGraph](/screenshots/usecase-full-graph.png)
+
 ---
 
 ## 1. Agent Tool Usage Profile
@@ -38,6 +42,8 @@ ORDER BY u.call_count DESC LIMIT 10
 [subagent] → read: 40 calls
 [subagent] → read: 30 calls
 ```
+
+![Agent Tool Usage Graph](/screenshots/usecase-agent-tools.png)
 
 **Insight:** Main agent heavily relies on `exec` (shell commands). Subagents focus on `read` — they're doing research while the main agent executes.
 
@@ -63,6 +69,8 @@ main → subagent:d7639251  (tools=36, tokens=0)
 main → cron:d7cbde0c      (tools=32, tokens=114,785)
 ```
 
+![Spawn Chain](/screenshots/usecase-spawn-chain.png)
+
 **Insight:** 6 child entities spawned. Some subagents (06b0e0af) did 60 tool calls with 0 token tracking — these may have been spawned before the tracing plugin loaded, so `llm_input` hooks weren't captured.
 
 ---
@@ -85,6 +93,8 @@ main → claude-sonnet-4-6:        21 calls,  3,065,408 tokens
 main → stepfun/step-3.5-flash:   42 calls,  2,967,660 tokens
 subagent → claude-opus-4-6:       7 calls,    249,224 tokens
 ```
+
+![Model Usage Graph](/screenshots/usecase-agent-models.png)
 
 **Insight:** Opus dominates at 48.8M tokens. Sonnet is used 21 times (likely for cheaper tasks). StepFun's free tier handles 42 calls — good for cost optimization. Subagents use minimal tokens compared to main.
 
@@ -136,6 +146,8 @@ subagent:06b0e0af → exec:  20 calls
 cron:d7cbde0c     → exec:  18 calls
 cron:d7cbde0c     → read:  12 calls
 ```
+
+![Subagent Tool Chains](/screenshots/usecase-subagent-tools.png)
 
 **Insight:** Subagents are primarily readers (read-heavy), while the cron job does a mix of reading and executing. This pattern suggests subagents are used for research/exploration tasks.
 
