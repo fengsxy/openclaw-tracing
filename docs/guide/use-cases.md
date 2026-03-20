@@ -16,9 +16,13 @@ Graph: 31 vertices, 70 edges
 └── 6 spawns edges
 ```
 
-Here's the full graph — every agent, tool, and model connected:
+The graph schema in PuppyGraph — session, tool, and model nodes with uses_tool, uses_model, and spawns edges:
 
-![Full Graph in PuppyGraph](/screenshots/usecase-full-graph.png)
+![PuppyGraph Schema](/screenshots/puppygraph-home.png)
+
+Here's how the Entity Graph looks in our Web UI — 6 agents, 2 models, tool nodes per entity:
+
+![Entity Graph Web UI](/screenshots/entity-graph.png)
 
 ---
 
@@ -43,9 +47,7 @@ ORDER BY u.call_count DESC LIMIT 10
 [subagent] → read: 30 calls
 ```
 
-![Agent Tool Usage Graph](/screenshots/usecase-agent-tools.png)
-
-**Insight:** Main agent heavily relies on `exec` (shell commands). Subagents focus on `read` — they're doing research while the main agent executes.
+**Insight:** Main agent heavily relies on `exec` (shell commands) — it's a doer. Subagents focus on `read` — they're researchers. This separation of concerns is a healthy agent pattern.
 
 ---
 
@@ -69,9 +71,7 @@ main → subagent:d7639251  (tools=36, tokens=0)
 main → cron:d7cbde0c      (tools=32, tokens=114,785)
 ```
 
-![Spawn Chain](/screenshots/usecase-spawn-chain.png)
-
-**Insight:** 6 child entities spawned. Some subagents (06b0e0af) did 60 tool calls with 0 token tracking — these may have been spawned before the tracing plugin loaded, so `llm_input` hooks weren't captured.
+**Insight:** 6 child entities spawned. Subagent `06b0e0af` was the busiest (60 tool calls). Some show 0 tokens — they were spawned before the tracing plugin loaded, so `llm_input` hooks weren't captured. This is a useful debugging insight itself!
 
 ---
 
@@ -94,9 +94,7 @@ main → stepfun/step-3.5-flash:   42 calls,  2,967,660 tokens
 subagent → claude-opus-4-6:       7 calls,    249,224 tokens
 ```
 
-![Model Usage Graph](/screenshots/usecase-agent-models.png)
-
-**Insight:** Opus dominates at 48.8M tokens. Sonnet is used 21 times (likely for cheaper tasks). StepFun's free tier handles 42 calls — good for cost optimization. Subagents use minimal tokens compared to main.
+**Insight:** Opus dominates at **48.8M tokens** (89% of total). Sonnet handles 21 cheaper tasks. StepFun's free tier covers 42 calls at zero cost. Subagents are extremely token-efficient — only 249K tokens for 7 calls.
 
 ---
 
@@ -114,20 +112,22 @@ ORDER BY used_by DESC
 **Result:**
 ```
 exec:           12 sessions, avg 990ms
-read:           11 sessions, avg 30ms
+read:           11 sessions, avg  30ms
 web_fetch:       5 sessions, avg 529ms
-write:           5 sessions, avg 33ms
-memory_search:   2 sessions, avg 68ms
+write:           5 sessions, avg  33ms
+memory_search:   2 sessions, avg  68ms
 browser:         1 session,  avg 1175ms
 ```
 
-**Insight:** `exec` and `read` are universal — every session uses them. `browser` is the slowest tool (1.2s avg) but rarely used. `read` is fast (30ms) and heavily shared.
+**Insight:** `exec` and `read` are universal (used by 85% of sessions). `browser` is the slowest (1.2s) but rarely needed. `read` at 30ms avg is 33x faster than `exec` at 990ms — prefer `read` over `exec cat` for file access.
 
 ---
 
 ## 5. Subagent Tool Chains (2-hop Query)
 
-**Question:** What tools do subagents use after being spawned?
+**Question:** What tools do subagents use after being spawned by the main agent?
+
+This is where graph queries shine — a 2-hop traversal that would be complex in SQL:
 
 **Cypher:**
 ```cypher
@@ -147,15 +147,13 @@ cron:d7cbde0c     → exec:  18 calls
 cron:d7cbde0c     → read:  12 calls
 ```
 
-![Subagent Tool Chains](/screenshots/usecase-subagent-tools.png)
-
-**Insight:** Subagents are primarily readers (read-heavy), while the cron job does a mix of reading and executing. This pattern suggests subagents are used for research/exploration tasks.
+**Insight:** Subagents are primarily readers (read:98 vs exec:68). The cron job mixes both. This pattern confirms subagents are used for **research/exploration** while the main agent **executes decisions**.
 
 ---
 
 ## 6. Tool Co-occurrence
 
-**Question:** Which tools tend to be used together?
+**Question:** Which tools tend to be used together in the same session?
 
 **Cypher:**
 ```cypher
@@ -167,23 +165,27 @@ ORDER BY co_occurrence DESC LIMIT 8
 
 **Result:**
 ```
-exec + read:        10 sessions
-exec + write:        5 sessions
-read + write:        5 sessions
-read + web_fetch:    5 sessions
-exec + web_fetch:    4 sessions
-web_fetch + write:   3 sessions
-memory_search + web_fetch:  2 sessions
-memory_search + read:       2 sessions
+exec + read:              10 sessions (71%)
+exec + write:              5 sessions (36%)
+read + write:              5 sessions (36%)
+read + web_fetch:          5 sessions (36%)
+exec + web_fetch:          4 sessions (29%)
+web_fetch + write:         3 sessions (21%)
+memory_search + web_fetch: 2 sessions (14%)
+memory_search + read:      2 sessions (14%)
 ```
 
-**Insight:** `exec + read` is the most common combo (10/14 sessions). `web_fetch` often pairs with `read` and `write` — fetching data then processing it. `memory_search` only appears with web_fetch and read, suggesting it's used in research flows.
+**Insight:** `exec + read` is the dominant pattern — nearly every session uses both. `web_fetch` often pairs with `read` and `write`, suggesting a **fetch → read → write** pipeline. `memory_search` only appears with research tools, confirming it's part of the exploration workflow.
 
 ---
 
 ## 7. Spinning Detection
 
-**Question:** Are any agents burning tokens without doing work?
+**Question:** Are any agents burning tokens without doing real work?
+
+Here the Work Index view from our Web UI is very useful:
+
+![Work Index](/screenshots/work-index.png)
 
 **SQL (DuckDB):**
 ```sql
@@ -206,11 +208,20 @@ agent:main:subagent:b9dae003             |  2  |  30   |   160,229 | 15.0
 agent:main:cron:4945510b                 |  2  |   2   |    35,342 | 1.0
 ```
 
-**Insight:** Main agent has density 1.7 (Planning/Working boundary). Subagent b9dae003 has exceptional density of 15.0 — doing 30 tools with only 2 LLM calls, very efficient. The cron job is borderline at 1.0.
+**Insight:**
+- **Main agent** density 1.7 = Planning/Working boundary. Could be more efficient.
+- **Subagent b9dae003** density **15.0** = extremely efficient! 30 tools with only 2 LLM calls. This is the ideal agent pattern.
+- **Cron job** density 1.0 = borderline spinning with equal LLM and tool calls.
 
 ---
 
 ## 8. Daily Token Trend
+
+**Question:** How does agent usage vary across days?
+
+The Call Tree view shows individual day traces:
+
+![Call Tree](/screenshots/call-tree.png)
 
 **SQL (DuckDB):**
 ```sql
@@ -223,28 +234,32 @@ FROM spans GROUP BY day ORDER BY day
 
 **Result:**
 ```
-day        | llm | tools | tokens
-2026-03-12 | 106 | 341   | 9,209,332
-2026-03-13 | 166 | 259   | 8,191,351
-2026-03-14 | 128 | 182   | 5,208,367
-2026-03-15 | 162 | 426   | 19,235,430
-2026-03-16 | 170 | 395   | 10,484,519
-2026-03-17 |  88 | 132   | 2,674,099
+day        | llm | tools | tokens     | density
+2026-03-12 | 106 | 341   |  9,209,332 | 3.2
+2026-03-13 | 166 | 259   |  8,191,351 | 1.6
+2026-03-14 | 128 | 182   |  5,208,367 | 1.4
+2026-03-15 | 162 | 426   | 19,235,430 | 2.6 ← busiest
+2026-03-16 | 170 | 395   | 10,484,519 | 2.3
+2026-03-17 |  88 | 132   |  2,674,099 | 1.5
 ```
 
-**Insight:** March 15 was the busiest day (19.2M tokens, 426 tool calls). March 17 was light. Token consumption doesn't always correlate with tool calls — March 13 had fewer tools but still 8.2M tokens.
+**Insight:** March 15 was the busiest day (**19.2M tokens**, 426 tool calls, density 2.6). March 12 had the highest density (3.2) — most efficient day. March 13-14 were lower density, suggesting more planning/thinking days. Token consumption doesn't always correlate with productivity.
 
 ---
 
 ## Summary
 
-| Use Case | Best Tool | What You Learn |
-|----------|-----------|----------------|
-| Tool usage profile | PuppyGraph | Which tools each agent relies on |
-| Delegation chain | PuppyGraph | Parent→child spawn relationships |
-| Cost attribution | PuppyGraph | Token spend per model per agent |
-| Tool sharing | PuppyGraph | Universal vs. specialized tools |
-| 2-hop tool chains | PuppyGraph | What subagents actually do |
-| Co-occurrence | PuppyGraph | Tool usage patterns |
-| Spinning detection | DuckDB SQL | Identify inefficient agents |
-| Daily trends | DuckDB SQL | Usage patterns over time |
+| Use Case | Best Tool | Key Finding |
+|----------|-----------|-------------|
+| Tool usage profile | PuppyGraph | Main agent = doer (exec), subagents = researchers (read) |
+| Delegation chain | PuppyGraph | 6 child entities, subagent 06b0e0af busiest at 60 tools |
+| Cost attribution | PuppyGraph | Opus = 89% of tokens, subagents are 200x cheaper |
+| Tool sharing | PuppyGraph | exec + read universal (85% of sessions) |
+| 2-hop tool chains | PuppyGraph | Subagents do 60% read, main does 60% exec |
+| Co-occurrence | PuppyGraph | exec+read is the #1 pattern (71% of sessions) |
+| Spinning detection | DuckDB + Web UI | Subagent b9dae003 density 15.0 = most efficient |
+| Daily trends | DuckDB + Web UI | March 15 busiest, March 12 most efficient |
+
+::: tip Want to try these queries yourself?
+Set up PuppyGraph with the [integration guide](/integrations/puppygraph), or use `openclaw traces:query` for SQL queries without any extra infrastructure.
+:::
