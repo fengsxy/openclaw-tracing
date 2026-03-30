@@ -91,6 +91,7 @@ const VIEWER_HTML = `<!DOCTYPE html>
   .tokens { color: var(--dim); margin-left: 8px; }
   .tool-params { color: var(--dim); margin-left: 4px; }
   .dim { color: var(--dim); }
+  .timestamp { color: var(--accent); font-size: 11px; margin-right: 8px; font-weight: 500; opacity: 0.6; }
 
   /* Entity Graph */
   .graph-container { position: relative; width: 100%; height: 600px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); overflow: hidden; }
@@ -165,7 +166,7 @@ const VIEWER_HTML = `<!DOCTYPE html>
   <select id="dateSelect"><option>Loading...</option></select>
   <span id="spanCount" class="dim"></span>
   <label style="margin-left:auto;display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--dim)">
-    <input type="checkbox" id="autoRefresh" checked> Auto-refresh (3s)
+    <input type="checkbox" id="autoRefresh" checked> Auto-refresh
     <span id="liveIndicator" style="width:8px;height:8px;border-radius:50%;background:#16a34a;display:inline-block;animation:pulse 1.5s infinite"></span>
   </label>
   <style>@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}</style>
@@ -220,7 +221,7 @@ async function load(date, isRefresh) {
   }
   knownSpanIds = new Set(spans.map(s => s.spanId));
   $('#spanCount').textContent = spans.length + ' spans';
-  render();
+  render(isRefresh);
 }
 
 // Tabs
@@ -231,19 +232,35 @@ $$('.tab').forEach(t => t.onclick = () => {
   render();
 });
 
-function render() {
+let graphSimId = 0;
+let lastEntitySpanCount = -1;
+function render(isRefresh) {
   const c = $('#content');
   if (!spans.length) { c.innerHTML = '<div class="empty">No traces for this date.</div>'; return; }
-  if (currentView === 'call') c.innerHTML = renderCallTree();
-  else if (currentView === 'entity') c.innerHTML = renderEntityTree();
-  else if (currentView === 'waterfall') c.innerHTML = renderWaterfall();
-  else if (currentView === 'workindex') c.innerHTML = renderWorkIndex();
+  if (currentView === 'entity') {
+    // Only rebuild entity graph when span count changes (avoid killing simulation)
+    if (!isRefresh || spans.length !== lastEntitySpanCount) {
+      graphSimId++;
+      lastEntitySpanCount = spans.length;
+      c.innerHTML = renderEntityTree();
+    }
+  } else {
+    graphSimId++;
+    if (currentView === 'call') c.innerHTML = renderCallTree();
+    else if (currentView === 'waterfall') c.innerHTML = renderWaterfall();
+    else if (currentView === 'workindex') c.innerHTML = renderWorkIndex();
+  }
 }
 
 // Utils
 function fmtDur(ms) {
   if (ms == null) return '';
   return ms < 1000 ? ms + 'ms' : (ms/1000).toFixed(1) + 's';
+}
+function fmtTime(ms) {
+  if (ms == null) return '';
+  const d = new Date(ms);
+  return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
@@ -266,7 +283,7 @@ function renderCallTree() {
     if (!children.has(s.parentSpanId)) children.set(s.parentSpanId, []);
     children.get(s.parentSpanId).push(s);
   }
-  for (const [,list] of children) list.sort((a,b) => a.startMs - b.startMs);
+  for (const [,list] of children) list.sort((a,b) => b.startMs - a.startMs);
   // Dedupe: prefer closed spans (with endMs) over open ones
   const closed = new Map();
   for (const s of spans) {
@@ -280,8 +297,8 @@ function renderCallTree() {
     if (!dedupedChildren.has(s.parentSpanId)) dedupedChildren.set(s.parentSpanId, []);
     dedupedChildren.get(s.parentSpanId).push(s);
   }
-  for (const [,list] of dedupedChildren) list.sort((a,b) => a.startMs - b.startMs);
-  const roots = deduped.filter(s => !s.parentSpanId).sort((a,b) => a.startMs - b.startMs);
+  for (const [,list] of dedupedChildren) list.sort((a,b) => b.startMs - a.startMs);
+  const roots = deduped.filter(s => !s.parentSpanId).sort((a,b) => b.startMs - a.startMs);
 
   let html = '';
   let groupId = 0;
@@ -309,6 +326,7 @@ function renderCallTree() {
 
   function spanDurTok(span) {
     let s = '';
+    if (span.startMs) s += '<span class="timestamp">' + fmtTime(span.startMs) + '</span>';
     if (span.durationMs != null) s += '<span class="duration">' + fmtDur(span.durationMs) + '</span>';
     if (span.kind === 'llm_call' && (span.tokensIn || span.tokensOut)) {
       s += '<span class="tokens">[in:' + (span.tokensIn||0) + ' out:' + (span.tokensOut||0) + ']</span>';
@@ -624,10 +642,11 @@ function initGraph(containerId, nodes, links) {
   container.appendChild(legend);
 
   // Force simulation
+  const mySimId = graphSimId;
   const alpha = { value: 1 };
   function tick() {
-    if (alpha.value < 0.001) return;
-    alpha.value *= 0.98;
+    if (alpha.value < 0.001 || mySimId !== graphSimId) return;
+    alpha.value *= 0.95;
 
     // Repulsion between all nodes
     for (let i = 0; i < nodes.length; i++) {
@@ -708,7 +727,7 @@ function renderWaterfall() {
   const total = maxEnd - minStart || 1;
 
   const kindOrder = { session: 0, llm_call: 1, subagent: 1, tool_call: 2 };
-  deduped.sort((a,b) => (a.startMs - b.startMs) || ((kindOrder[a.kind]||9) - (kindOrder[b.kind]||9)));
+  deduped.sort((a,b) => (b.startMs - a.startMs) || ((kindOrder[a.kind]||9) - (kindOrder[b.kind]||9)));
 
   let html = '<div class="waterfall">';
   for (const s of deduped) {
@@ -909,9 +928,10 @@ function renderWorkIndex() {
 
 // Auto-refresh polling
 let pollTimer = null;
+let pollInterval = 3000;
 function startPolling() {
   stopPolling();
-  pollTimer = setInterval(async () => {
+  async function poll() {
     const sel = $('#dateSelect');
     if (!sel.value || sel.value === 'No traces') {
       const dates = await fetchDates();
@@ -919,16 +939,23 @@ function startPolling() {
         sel.innerHTML = dates.map(d => '<option value="'+d+'">'+d+'</option>').join('');
         load(dates[0]);
       }
+      pollTimer = setTimeout(poll, 3000);
       return;
     }
     const newSpans = await fetchSpans(sel.value);
     if (newSpans.length !== spans.length) {
       load(sel.value, true);
+      pollInterval = 1000; // speed up when active
+    } else {
+      pollInterval = Math.min(pollInterval + 500, 3000); // slow down when idle
     }
-  }, 3000);
+    $('#spanCount').textContent = spans.length + ' spans · ' + (pollInterval/1000).toFixed(1) + 's';
+    pollTimer = setTimeout(poll, pollInterval);
+  }
+  poll();
 }
 function stopPolling() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
 }
 $('#autoRefresh').onchange = (e) => {
   const indicator = $('#liveIndicator');
